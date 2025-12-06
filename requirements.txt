@@ -1,0 +1,10 @@
+torch
+transformers
+accelerate
+bitsandbytes
+xformers
+streamlit
+sentence-transformers
+faiss-cpu
+numpy
+git+https://github.com/unslothai/unsloth.git

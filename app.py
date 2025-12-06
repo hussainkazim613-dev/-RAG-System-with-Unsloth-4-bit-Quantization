@@ -1,6 +1,6 @@
 import streamlit as st
 import torch
-from unsloth import FastLanguageModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
@@ -10,7 +10,7 @@ from typing import List, Tuple
 
 # Page configuration
 st.set_page_config(
-    page_title="RAG System with Unsloth",
+    page_title="RAG System with 4-bit LLM",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -117,15 +117,42 @@ def load_models():
         other downstream tasks in NLP applications.""",
     ]
     
-    # Load LLM
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
-        max_seq_length=2048,
-        dtype=None,
+    # Configure 4-bit quantization
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        device_map="auto",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
     )
-    FastLanguageModel.for_inference(model)
+    
+    # Load LLM with 4-bit quantization
+    model_name = "meta-llama/Llama-3.2-3B-Instruct"  # or "microsoft/phi-2" for smaller
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        model.eval()
+    except Exception as e:
+        # Fallback to smaller model if main model fails
+        st.warning(f"Main model failed, using fallback model: {e}")
+        model_name = "microsoft/phi-2"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        model.eval()
+    
+    # Set padding token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
     # Load embedding model
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -147,7 +174,7 @@ def load_models():
     index = faiss.IndexFlatIP(embedding_dim)
     index.add(chunk_embeddings.astype('float32'))
     
-    return model, tokenizer, embedding_model, index, document_chunks
+    return model, tokenizer, embedding_model, index, document_chunks, model_name
 
 # ============================================================================
 # RAG FUNCTIONS
@@ -203,26 +230,19 @@ def generate_response(
     context = "\n\n".join(context_parts)
     
     # Create prompt
-    prompt = f"""You are a helpful AI assistant. Use the following context to answer the user's question accurately and concisely.
+    prompt = f"""Use the following context to answer the question accurately and concisely.
 
 Context:
 {context}
 
 Question: {query}
 
-Answer: Based on the provided context,"""
+Answer:"""
     
-    # Format for model
-    messages = [{"role": "user", "content": prompt}]
-    formatted_prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(model.device)
     
     # Generate
-    inputs = tokenizer([formatted_prompt], return_tensors="pt").to("cuda")
-    
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -230,11 +250,18 @@ Answer: Based on the provided context,"""
             temperature=temperature,
             do_sample=True,
             top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
         )
     
+    # Decode
     full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = full_response.split("Answer: Based on the provided context,")[-1].strip()
+    
+    # Extract answer (after "Answer:")
+    if "Answer:" in full_response:
+        response = full_response.split("Answer:")[-1].strip()
+    else:
+        response = full_response[len(prompt):].strip()
     
     return {
         "response": response,
@@ -248,16 +275,17 @@ Answer: Based on the provided context,"""
 
 def main():
     # Header
-    st.markdown('<p class="main-header">🤖 RAG System with Unsloth 4-bit Quantization</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">🤖 RAG System with 4-bit Quantization</p>', unsafe_allow_html=True)
     st.markdown("### Retrieval-Augmented Generation powered by 4-bit quantized LLM")
     
     # Load models
     with st.spinner("🔄 Loading models... (This may take 1-2 minutes on first run)"):
         try:
-            model, tokenizer, embedding_model, index, document_chunks = load_models()
-            st.success("✅ Models loaded successfully!")
+            model, tokenizer, embedding_model, index, document_chunks, model_name = load_models()
+            st.success(f"✅ Models loaded successfully! Using: {model_name}")
         except Exception as e:
             st.error(f"❌ Error loading models: {e}")
+            st.info("💡 This app requires GPU. Make sure you're using Hugging Face Spaces with GPU enabled.")
             st.stop()
     
     # Sidebar
@@ -293,11 +321,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("📊 System Info")
     
+    st.sidebar.info(f"**Model**: {model_name.split('/')[-1]}")
+    
     if torch.cuda.is_available():
         vram_used = torch.cuda.memory_allocated(0) / 1024**3
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         st.sidebar.metric("GPU", torch.cuda.get_device_name(0))
         st.sidebar.metric("VRAM Usage", f"{vram_used:.2f} / {vram_total:.1f} GB")
+    else:
+        st.sidebar.warning("⚠️ No GPU detected. Performance will be slow.")
     
     st.sidebar.metric("Index Size", f"{index.ntotal} vectors")
     st.sidebar.metric("Embedding Dim", embedding_model.get_sentence_embedding_dimension())
@@ -386,6 +418,7 @@ def main():
                 
             except Exception as e:
                 st.error(f"❌ Error generating response: {e}")
+                st.info("Try reducing max_tokens or using a smaller context window.")
     
     elif generate_button and not query:
         st.warning("⚠️ Please enter a question first!")
@@ -396,7 +429,7 @@ def main():
         """
         <div style='text-align: center; color: gray;'>
             Built with ❤️ using 
-            <a href='https://github.com/unslothai/unsloth' target='_blank'>Unsloth</a> • 
+            <a href='https://huggingface.co/transformers' target='_blank'>Transformers</a> • 
             <a href='https://streamlit.io' target='_blank'>Streamlit</a> • 
             <a href='https://github.com/facebookresearch/faiss' target='_blank'>FAISS</a>
         </div>
